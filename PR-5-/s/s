@@ -1,0 +1,429 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import sqlite3
+import hashlib
+import re
+import csv
+from datetime import datetime
+from pathlib import Path
+
+DB = "kabanford.db"
+
+def db():
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    c = db()
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE,
+            password TEXT,
+            role TEXT DEFAULT 'student',
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS teachers(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            description TEXT,
+            price REAL,
+            rating REAL
+        );
+        CREATE TABLE IF NOT EXISTS enrollments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            teacher_id INTEGER,
+            date TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(teacher_id) REFERENCES teachers(id)
+        );
+    """)
+    
+    if not c.execute("SELECT COUNT(*) FROM teachers").fetchone()[0]:
+        c.execute("INSERT INTO teachers(name, description, price, rating) VALUES(?,?,?,?)",
+                 ("Кабанов Никита", "Знает все предметы", 3500, 5.0))
+        c.execute("INSERT INTO teachers(name, description, price, rating) VALUES(?,?,?,?)",
+                 ("Смирнов Данил", "Ничего не знает", 500, 2.0))
+    
+    if not c.execute("SELECT COUNT(*) FROM users WHERE email='admin@kabanford.ru'").fetchone()[0]:
+        c.execute("INSERT INTO users(email,password,role) VALUES(?,?,?)",
+                 ("admin@kabanford.ru", hashlib.sha256("admin123".encode()).hexdigest(), "admin"))
+    
+    c.commit()
+    c.close()
+
+class KabanFordApp:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("KabanFord - Онлайн-Школа")
+        self.root.geometry("1200x700")
+        self.root.configure(bg="#f5f5f5")
+        self.current_user = None
+        init_db()
+        self.show_dashboard()
+        self.root.mainloop()
+
+    def clear_screen(self):
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+    def show_dashboard(self):
+        self.clear_screen()
+        
+        header = tk.Frame(self.root, bg="#2c3e50", height=80)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        
+        logo = tk.Label(header, text=" KabanFord", font=("Arial", 24, "bold"), 
+                       bg="#2c3e50", fg="white")
+        logo.pack(side="left", padx=30, pady=20)
+        
+        nav_frame = tk.Frame(header, bg="#2c3e50")
+        nav_frame.pack(side="left", padx=50, pady=20)
+        
+        for text, cmd in [("Курсы", lambda: messagebox.showinfo("Курсы", "Раздел в разработке")),
+                         ("Профиль", self.show_profile),
+                         ("Преподаватели", self.show_teachers)]:
+            btn = tk.Button(nav_frame, text=text, font=("Arial", 11),
+                           bg="#2c3e50", fg="white", bd=0,
+                           activebackground="#34495e", activeforeground="white",
+                           command=cmd, cursor="hand2")
+            btn.pack(side="left", padx=15)
+        
+        auth_frame = tk.Frame(header, bg="#2c3e50")
+        auth_frame.pack(side="right", padx=30, pady=20)
+        
+        if self.current_user:
+            tk.Label(auth_frame, text=f"👤 {self.current_user['email']}", 
+                    bg="#2c3e50", fg="white", font=("Arial", 10)).pack(side="left", padx=10)
+            tk.Button(auth_frame, text="Выход", font=("Arial", 10),
+                     bg="#e74c3c", fg="white", bd=0, padx=15, pady=5,
+                     command=self.logout, cursor="hand2").pack(side="left", padx=5)
+        else:
+            tk.Button(auth_frame, text="Вход", font=("Arial", 10),
+                     bg="#3498db", fg="white", bd=0, padx=20, pady=5,
+                     command=self.show_login, cursor="hand2").pack(side="left", padx=5)
+            tk.Button(auth_frame, text="Регистрация", font=("Arial", 10),
+                     bg="#27ae60", fg="white", bd=0, padx=15, pady=5,
+                     command=self.show_register, cursor="hand2").pack(side="left", padx=5)
+        
+        content = tk.Frame(self.root, bg="#f5f5f5")
+        content.pack(fill="both", expand=True, padx=40, pady=40)
+        
+        title = tk.Label(content, text="Наш прогресс Онлайн-Школы", 
+                        font=("Arial", 28, "bold"), bg="#f5f5f5", fg="#2c3e50")
+        title.pack(pady=(0, 10))
+        
+        subtitle = tk.Label(content, 
+                           text="Мы гордимся нашими достижениями и отзывами студентов",
+                           font=("Arial", 12), bg="#f5f5f5", fg="#7f8c8d")
+        subtitle.pack(pady=(0, 40))
+        
+        stats_frame = tk.Frame(content, bg="#f5f5f5")
+        stats_frame.pack(fill="x")
+        
+        stats_data = [
+            ("👥", "50k+", "Клиентов", "новых клиентов за год"),
+            ("👨‍", "90+", "Учителя", "методистов помогают ученикам"),
+            ("⭐", "99%", "Success", "довольных клиентов")
+        ]
+        
+        for icon, value, title_text, desc in stats_data:
+            stat_box = tk.Frame(stats_frame, bg="white", relief="raised", bd=2)
+            stat_box.pack(side="left", fill="both", expand=True, padx=15, pady=10)
+            
+            tk.Label(stat_box, text=icon, font=("Arial", 36), 
+                    bg="white").pack(pady=10)
+            tk.Label(stat_box, text=value, font=("Arial", 32, "bold"), 
+                    bg="white", fg="#2c3e50").pack()
+            tk.Label(stat_box, text=title_text, font=("Arial", 14, "bold"), 
+                    bg="white", fg="#34495e").pack()
+            tk.Label(stat_box, text=desc, font=("Arial", 9), 
+                    bg="white", fg="#95a5a6").pack(pady=(0, 10))
+
+    def show_login(self):
+        self.clear_screen()
+        
+        tk.Button(self.root, text="← Назад", font=("Arial", 10),
+                 bg="#95a5a6", fg="white", bd=0, padx=15, pady=5,
+                 command=self.show_dashboard, cursor="hand2").place(x=20, y=20)
+        
+        login_frame = tk.Frame(self.root, bg="white", relief="raised", bd=3)
+        login_frame.place(relx=0.5, rely=0.5, anchor="center", width=400, height=350)
+        
+        tk.Label(login_frame, text="🔐 Вход в KabanFord", 
+                font=("Arial", 20, "bold"), bg="white", fg="#2c3e50").pack(pady=30)
+        
+        tk.Label(login_frame, text="Email", font=("Arial", 10), 
+                bg="white", fg="#7f8c8d").pack(anchor="w", padx=30)
+        email_entry = tk.Entry(login_frame, font=("Arial", 11), bd=2, relief="solid")
+        email_entry.pack(fill="x", padx=30, pady=5)
+        
+        tk.Label(login_frame, text="Пароль", font=("Arial", 10), 
+                bg="white", fg="#7f8c8d").pack(anchor="w", padx=30)
+        pwd_entry = tk.Entry(login_frame, font=("Arial", 11), show="*", bd=2, relief="solid")
+        pwd_entry.pack(fill="x", padx=30, pady=5)
+        
+        tk.Button(login_frame, text="Забыли пароль?", font=("Arial", 9),
+                 bg="white", fg="#3498db", bd=0, cursor="hand2",
+                 command=lambda: messagebox.showinfo("Восстановление", 
+                           "Обратитесь в поддержку: support@kabanford.ru")).pack(pady=10)
+        
+        error_label = tk.Label(login_frame, text="", font=("Arial", 9), 
+                              bg="white", fg="red")
+        error_label.pack()
+        
+        def do_login():
+            email = email_entry.get().strip()
+            password = pwd_entry.get()
+            
+            if not email or not password:
+                error_label.config(text="Заполните все поля")
+                return
+            
+            c = db()
+            user = c.execute("SELECT * FROM users WHERE email=? AND password=?",
+                           (email, hashlib.sha256(password.encode()).hexdigest())).fetchone()
+            c.close()
+            
+            if user:
+                self.current_user = dict(user)
+                self.show_dashboard()
+            else:
+                error_label.config(text="Неверный email или пароль")
+        
+        tk.Button(login_frame, text="Войти", font=("Arial", 12, "bold"),
+                 bg="#3498db", fg="white", bd=0, padx=30, pady=10,
+                 command=do_login, cursor="hand2").pack(pady=20)
+        
+        pwd_entry.bind("<Return>", lambda e: do_login())
+
+    def show_register(self):
+        self.clear_screen()
+        
+        tk.Button(self.root, text="← Назад", font=("Arial", 10),
+                 bg="#95a5a6", fg="white", bd=0, padx=15, pady=5,
+                 command=self.show_dashboard, cursor="hand2").place(x=20, y=20)
+        
+        reg_frame = tk.Frame(self.root, bg="white", relief="raised", bd=3)
+        reg_frame.place(relx=0.5, rely=0.5, anchor="center", width=400, height=400)
+        
+        tk.Label(reg_frame, text="📝 Регистрация", 
+                font=("Arial", 20, "bold"), bg="white", fg="#2c3e50").pack(pady=20)
+        
+        tk.Label(reg_frame, text="Email", font=("Arial", 10), 
+                bg="white", fg="#7f8c8d").pack(anchor="w", padx=30)
+        email_entry = tk.Entry(reg_frame, font=("Arial", 11), bd=2, relief="solid")
+        email_entry.pack(fill="x", padx=30, pady=5)
+        
+        tk.Label(reg_frame, text="Пароль", font=("Arial", 10), 
+                bg="white", fg="#7f8c8d").pack(anchor="w", padx=30)
+        pwd_entry = tk.Entry(reg_frame, font=("Arial", 11), show="*", bd=2, relief="solid")
+        pwd_entry.pack(fill="x", padx=30, pady=5)
+        
+        terms_var = tk.BooleanVar()
+        terms_check = tk.Checkbutton(reg_frame, 
+            text="Я согласен с условиями использования и политикой конфиденциальности",
+            variable=terms_var, bg="white", font=("Arial", 9), anchor="w")
+        terms_check.pack(padx=30, pady=15)
+        
+        error_label = tk.Label(reg_frame, text="", font=("Arial", 9), 
+                              bg="white", fg="red")
+        error_label.pack()
+        
+        def do_register():
+            email = email_entry.get().strip()
+            password = pwd_entry.get()
+            
+            if not email or not password:
+                error_label.config(text="Заполните все поля")
+                return
+            if not re.match(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$', email):
+                error_label.config(text="Неверный формат email")
+                return
+            if len(password) < 6:
+                error_label.config(text="Пароль должен быть не менее 6 символов")
+                return
+            if not terms_var.get():
+                error_label.config(text="Примите условия использования")
+                return
+            
+            c = db()
+            try:
+                c.execute("INSERT INTO users(email,password,created_at) VALUES(?,?,?)",
+                         (email, hashlib.sha256(password.encode()).hexdigest(), 
+                          datetime.now().isoformat()))
+                c.commit()
+                c.close()
+                messagebox.showinfo("Успех", "Регистрация успешна! Теперь войдите.")
+                self.show_login()
+            except sqlite3.IntegrityError:
+                c.close()
+                error_label.config(text="Этот email уже зарегистрирован")
+        
+        tk.Button(reg_frame, text="Зарегистрироваться", font=("Arial", 12, "bold"),
+                 bg="#27ae60", fg="white", bd=0, padx=20, pady=10,
+                 command=do_register, cursor="hand2").pack(pady=20)
+
+    def show_teachers(self):
+        self.clear_screen()
+        
+        header = tk.Frame(self.root, bg="#2c3e50", height=60)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        
+        tk.Button(header, text="← Назад", font=("Arial", 10),
+                 bg="#34495e", fg="white", bd=0, padx=15, pady=5,
+                 command=self.show_dashboard, cursor="hand2").pack(side="left", padx=20, pady=10)
+        
+        tk.Label(header, text="👨‍🏫 Преподаватели", font=("Arial", 18, "bold"),
+                bg="#2c3e50", fg="white").pack(pady=15)
+        
+        content = tk.Frame(self.root, bg="#f5f5f5")
+        content.pack(fill="both", expand=True, padx=40, pady=30)
+        
+        headers_frame = tk.Frame(content, bg="#34495e")
+        headers_frame.pack(fill="x")
+        
+        headers = [("Преподаватели", 300), ("Стоимость обучения", 200), 
+                  ("Рейтинг", 150), ("Запись", 150)]
+        for text, width in headers:
+            tk.Label(headers_frame, text=text, font=("Arial", 11, "bold"),
+                    bg="#34495e", fg="white", width=width//8).pack(side="left", padx=5, pady=10)
+        
+        c = db()
+        teachers = c.execute("SELECT * FROM teachers").fetchall()
+        c.close()
+        
+        for teacher in teachers:
+            row = tk.Frame(content, bg="white", relief="raised", bd=1)
+            row.pack(fill="x", pady=5)
+            
+            info_frame = tk.Frame(row, bg="white")
+            info_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+            
+            tk.Label(info_frame, text=teacher["name"], 
+                    font=("Arial", 12, "bold"), bg="white", 
+                    fg="#2c3e50", anchor="w").pack()
+            tk.Label(info_frame, text=teacher["description"], 
+                    font=("Arial", 9), bg="white", 
+                    fg="#7f8c8d", anchor="w").pack()
+            
+            tk.Label(row, text=f"{teacher['price']} РУБ.", 
+                    font=("Arial", 12, "bold"), bg="white", 
+                    fg="#e74c3c", width=20).pack(side="left", padx=10)
+            
+            stars = "⭐" * int(teacher["rating"])
+            tk.Label(row, text=stars, font=("Arial", 14), 
+                    bg="white", width=15).pack(side="left")
+            
+            def book(teacher_id=teacher["id"], name=teacher["name"]):
+                if not self.current_user:
+                    messagebox.showwarning("Внимание", "Сначала войдите в систему!")
+                    self.show_login()
+                    return
+                if messagebox.askyesno("Запись", f"Записаться к {name}?"):
+                    c = db()
+                    c.execute("INSERT INTO enrollments(user_id,teacher_id,date) VALUES(?,?,?)",
+                             (self.current_user["id"], teacher_id, datetime.now().isoformat()))
+                    c.commit()
+                    c.close()
+                    messagebox.showinfo("Успех", f"Вы записаны к {name}!")
+            
+            tk.Button(row, text="Записаться", font=("Arial", 10),
+                     bg="#27ae60", fg="white", bd=0, padx=15, pady=5,
+                     command=book, cursor="hand2").pack(side="left", padx=10, pady=10)
+
+    def show_profile(self):
+        if not self.current_user:
+            messagebox.showwarning("Внимание", "Сначала войдите в систему!")
+            self.show_login()
+            return
+        
+        self.clear_screen()
+        
+        header = tk.Frame(self.root, bg="#2c3e50", height=60)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        
+        tk.Button(header, text="← Назад", font=("Arial", 10),
+                 bg="#34495e", fg="white", bd=0, padx=15, pady=5,
+                 command=self.show_dashboard, cursor="hand2").pack(side="left", padx=20, pady=10)
+        
+        tk.Label(header, text="👤 Профиль пользователя", font=("Arial", 18, "bold"),
+                bg="#2c3e50", fg="white").pack(pady=15)
+        
+        content = tk.Frame(self.root, bg="#f5f5f5")
+        content.pack(fill="both", expand=True, padx=40, pady=30)
+        
+        info_frame = tk.Frame(content, bg="white", relief="raised", bd=2)
+        info_frame.pack(fill="both", expand=True, padx=100, pady=30)
+        
+        tk.Label(info_frame, text="Информация о пользователе", 
+                font=("Arial", 16, "bold"), bg="white", 
+                fg="#2c3e50").pack(pady=20)
+        
+        details = [
+            ("Email:", self.current_user["email"]),
+            ("Роль:", self.current_user["role"]),
+            ("Дата регистрации:", self.current_user["created_at"][:10])
+        ]
+        
+        for label, value in details:
+            frame = tk.Frame(info_frame, bg="#ecf0f1")
+            frame.pack(fill="x", padx=30, pady=5)
+            tk.Label(frame, text=label, font=("Arial", 11, "bold"),
+                    bg="#ecf0f1", fg="#7f8c8d", width=20, anchor="w").pack(side="left", padx=10, pady=10)
+            tk.Label(frame, text=value, font=("Arial", 11),
+                    bg="#ecf0f1", fg="#2c3e50", anchor="w").pack(side="left", padx=10, pady=10)
+        
+        c = db()
+        enrollments = c.execute("""
+            SELECT t.name, t.price, e.date 
+            FROM enrollments e
+            JOIN teachers t ON e.teacher_id = t.id
+            WHERE e.user_id = ?
+        """, (self.current_user["id"],)).fetchall()
+        c.close()
+        
+        tk.Label(info_frame, text="\nМои записи к преподавателям:", 
+                font=("Arial", 14, "bold"), bg="white", 
+                fg="#2c3e50").pack(pady=(30, 10))
+        
+        if enrollments:
+            for enr in enrollments:
+                tk.Label(info_frame, text=f"• {enr[0]} - {enr[1]} РУБ. ({enr[2][:10]})",
+                        font=("Arial", 10), bg="white", 
+                        fg="#34495e").pack(anchor="w", padx=30, pady=2)
+        else:
+            tk.Label(info_frame, text="Пока нет записей", 
+                    font=("Arial", 10), bg="white", 
+                    fg="#95a5a6").pack(pady=10)
+        
+        tk.Button(info_frame, text="Экспорт в CSV", font=("Arial", 10),
+                 bg="#3498db", fg="white", bd=0, padx=15, pady=5,
+                 command=lambda: self.export_profile(enrollments), 
+                 cursor="hand2").pack(pady=20)
+
+    def export_profile(self, enrollments):
+        if not enrollments:
+            messagebox.showinfo("Экспорт", "Нет данных для экспорта")
+            return
+        path = f"exports/profile_{self.current_user['id']}.csv"
+        Path("exports").mkdir(exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Преподаватель", "Цена", "Дата"])
+            for enr in enrollments:
+                writer.writerow(enr)
+        messagebox.showinfo("Экспорт", f"Данные сохранены: {path}")
+
+    def logout(self):
+        if messagebox.askyesno("Выход", "Выйти из аккаунта?"):
+            self.current_user = None
+            self.show_dashboard()
+
+if __name__ == "__main__":
+    KabanFordApp()
