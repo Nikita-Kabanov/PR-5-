@@ -4,426 +4,590 @@ import sqlite3
 import hashlib
 import re
 import csv
-from datetime import datetime
+import json
+import logging
+from datetime import datetime, timedelta
 from pathlib import Path
+from collections import defaultdict
 
+# === КОНФИГУРАЦИЯ ===
 DB = "kabanford.db"
+LOGS_DIR = Path("logs")
+CONFIG_FILE = Path("config.json")
+LOCKOUT_TIME = 30
+MAX_ATTEMPTS = 3
 
+# === ЛОГИРОВАНИЕ ===
+LOGS_DIR.mkdir(exist_ok=True)
+logging.basicConfig(
+    filename=LOGS_DIR / "actions.log",
+    level=logging.INFO,
+    format="[%(asctime)s] [%(message)s]",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    encoding="utf-8"
+)
+
+def log_action(user_email, role, action, result):
+    email = user_email or "guest"
+    logging.info(f"[{email}] [{role}] [{action}] [{result}]")
+
+# === УТИЛИТЫ ===
 def db():
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     return conn
 
+def validate_password(password):
+    if len(password) < 8: return False, "Минимум 8 символов"
+    if not re.search(r"[A-Z]", password): return False, "Хотя бы одна заглавная буква"
+    if not re.search(r"\d", password): return False, "Хотя бы одна цифра"
+    if not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>\/?]", password): return False, "Хотя бы один спецсимвол"
+    return True, None
+
+def validate_email(email):
+    if not re.match(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$', email):
+        return False, "Неверный формат email"
+    domain = email.split('@')[1].lower()
+    if 'admin' in domain: return False, "Домен не может содержать 'admin'"
+    return True, None
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except: pass
+    return {}
+
+def save_config(config):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+# === МЕНЕДЖЕР ПОПЫТОК ВХОДА ===
+class LoginAttemptManager:
+    def __init__(self):
+        self.attempts = defaultdict(list)
+    def record_attempt(self, email, success):
+        now = datetime.now()
+        if success: self.attempts[email] = []
+        else:
+            self.attempts[email].append(now)
+            self.attempts[email] = [t for t in self.attempts[email] if now - t < timedelta(seconds=LOCKOUT_TIME)]
+    def is_locked(self, email):
+        now = datetime.now()
+        recent = [t for t in self.attempts.get(email, []) if now - t < timedelta(seconds=LOCKOUT_TIME)]
+        if len(recent) >= MAX_ATTEMPTS:
+            return True, LOCKOUT_TIME - int((now - recent[-1]).total_seconds())
+        return False, 0
+
+login_manager = LoginAttemptManager()
+
+# === ИНИЦИАЛИЗАЦИЯ БД ===
 def init_db():
     c = db()
     c.executescript("""
+        CREATE TABLE IF NOT EXISTS roles(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, description TEXT);
         CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE,
-            password TEXT,
-            role TEXT DEFAULT 'student',
-            created_at TEXT
-        );
+            email TEXT UNIQUE, password TEXT, role TEXT DEFAULT 'student', created_at TEXT,
+            FOREIGN KEY(role) REFERENCES roles(name));
         CREATE TABLE IF NOT EXISTS teachers(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            description TEXT,
-            price REAL,
-            rating REAL
-        );
+            name TEXT UNIQUE, description TEXT, price REAL, rating REAL);
+        CREATE TABLE IF NOT EXISTS courses(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT UNIQUE, description TEXT, teacher_id INTEGER, price REAL, duration_hours INTEGER,
+            FOREIGN KEY(teacher_id) REFERENCES teachers(id));
         CREATE TABLE IF NOT EXISTS enrollments(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            teacher_id INTEGER,
-            date TEXT,
+            user_id INTEGER, teacher_id INTEGER, course_id INTEGER, date TEXT, status TEXT DEFAULT 'active',
             FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(teacher_id) REFERENCES teachers(id)
-        );
+            FOREIGN KEY(teacher_id) REFERENCES teachers(id),
+            FOREIGN KEY(course_id) REFERENCES courses(id));
     """)
-    
+    if not c.execute("SELECT COUNT(*) FROM roles").fetchone()[0]:
+        c.execute("INSERT INTO roles(name,description) VALUES(?,?)", ("admin","Полный доступ"))
+        c.execute("INSERT INTO roles(name,description) VALUES(?,?)", ("student","Стандартный пользователь"))
     if not c.execute("SELECT COUNT(*) FROM teachers").fetchone()[0]:
-        c.execute("INSERT INTO teachers(name, description, price, rating) VALUES(?,?,?,?)",
-                 ("Кабанов Никита", "Знает все предметы", 3500, 5.0))
-        c.execute("INSERT INTO teachers(name, description, price, rating) VALUES(?,?,?,?)",
-                 ("Смирнов Данил", "Ничего не знает", 500, 2.0))
-    
+        c.execute("INSERT INTO teachers(name,description,price,rating) VALUES(?,?,?,?)", ("Кабанов Никита","Знает все предметы",3500,5.0))
+        c.execute("INSERT INTO teachers(name,description,price,rating) VALUES(?,?,?,?)", ("Смирнов Данил","Ничего не знает",500,2.0))
+    if not c.execute("SELECT COUNT(*) FROM courses").fetchone()[0]:
+        c.execute("INSERT INTO courses(title,description,teacher_id,price,duration_hours) VALUES(?,?,?,?,?)", ("Математика ПРО","Алгебра и геометрия для ОГЭ/ЕГЭ",1,2500,40))
+        c.execute("INSERT INTO courses(title,description,teacher_id,price,duration_hours) VALUES(?,?,?,?,?)", ("Английский с нуля","Разговорный английский за 3 месяца",2,1800,30))
     if not c.execute("SELECT COUNT(*) FROM users WHERE email='admin@kabanford.ru'").fetchone()[0]:
-        c.execute("INSERT INTO users(email,password,role) VALUES(?,?,?)",
-                 ("admin@kabanford.ru", hashlib.sha256("admin123".encode()).hexdigest(), "admin"))
-    
-    c.commit()
-    c.close()
+        c.execute("INSERT INTO users(email,password,role,created_at) VALUES(?,?,?,?)",
+                 ("admin@kabanford.ru", hashlib.sha256("Admin123!".encode()).hexdigest(), "admin", datetime.now().isoformat()))
+    c.commit(); c.close()
+    log_action("system", "admin", "INIT_DB", "SUCCESS")
 
+# === ЦВЕТОВЫЕ ТЕМЫ И СТИЛИ ===
+THEMES = {
+    "light": {
+        "bg": "#fafbfc", "header_bg": "#667eea", "header_fg": "#ffffff",
+        "card_bg": "#ffffff", "card_border": "#e2e8f0", "text": "#2d3748", "text_secondary": "#718096",
+        "primary": "#667eea", "primary_hover": "#556cd6", "success": "#48bb78", "success_hover": "#38a169",
+        "danger": "#f56565", "danger_hover": "#e53e3e", "input_bg": "#f7fafc", "input_border": "#cbd5e0"
+    },
+    "dark": {
+        "bg": "#1a202c", "header_bg": "#4c51bf", "header_fg": "#f7fafc",
+        "card_bg": "#2d3748", "card_border": "#4a5568", "text": "#f7fafc", "text_secondary": "#a0aec0",
+        "primary": "#7f9cf5", "primary_hover": "#667eea", "success": "#68d391", "success_hover": "#48bb78",
+        "danger": "#fc8181", "danger_hover": "#f56565", "input_bg": "#2d3748", "input_border": "#4a5568"
+    }
+}
+
+def setup_ttk_styles(root, colors):
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    style.configure("TFrame", background=colors["bg"])
+    style.configure("Soft.TButton", font=("Segoe UI", 10), padding=10, background=colors["primary"], foreground="white", borderwidth=0, focusthickness=0)
+    style.map("Soft.TButton", background=[("active", colors["primary_hover"]), ("pressed", colors["primary"])])
+    style.configure("Success.TButton", font=("Segoe UI", 10), padding=10, background=colors["success"], foreground="white", borderwidth=0)
+    style.map("Success.TButton", background=[("active", colors["success_hover"])])
+    style.configure("Danger.TButton", font=("Segoe UI", 10), padding=10, background=colors["danger"], foreground="white", borderwidth=0)
+    style.map("Danger.TButton", background=[("active", colors["danger_hover"])])
+    style.configure("Soft.TEntry", padding=8, fieldbackground=colors["input_bg"], bordercolor=colors["input_border"], font=("Segoe UI", 11))
+    style.configure("Soft.TCombobox", padding=8, fieldbackground=colors["input_bg"], arrowcolor=colors["text_secondary"])
+    style.configure("Soft.TCheckbutton", background=colors["card_bg"], foreground=colors["text"])
+    style.configure("Soft.Treeview", background=colors["card_bg"], fieldbackground=colors["card_bg"], foreground=colors["text"], rowheight=32, font=("Segoe UI", 9))
+    style.configure("Soft.Treeview.Heading", font=("Segoe UI", 10, "bold"), background=colors["header_bg"], foreground=colors["header_fg"], padding=8)
+
+# === ПРИЛОЖЕНИЕ ===
 class KabanFordApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("KabanFord - Онлайн-Школа")
         self.root.geometry("1200x700")
-        self.root.configure(bg="#f5f5f5")
+        self.root.configure(bg=THEMES["light"]["bg"])
+        setup_ttk_styles(self.root, THEMES["light"])
         self.current_user = None
+        self.config = load_config()
+        self.theme = self.config.get("theme", "light")
         init_db()
+        self.apply_theme()
         self.show_dashboard()
         self.root.mainloop()
+
+    def apply_theme(self):
+        colors = THEMES[self.theme]
+        self.root.configure(bg=colors["bg"])
+        setup_ttk_styles(self.root, colors)
+        if hasattr(self, 'current_screen'):
+            getattr(self, f"show_{self.current_screen}", self.show_dashboard)()
 
     def clear_screen(self):
         for widget in self.root.winfo_children():
             widget.destroy()
 
+    def log_and_show(self, screen_name):
+        self.current_screen = screen_name
+        email = self.current_user["email"] if self.current_user else "guest"
+        role = self.current_user["role"] if self.current_user else "guest"
+        log_action(email, role, f"NAVIGATE_{screen_name.upper()}", "SUCCESS")
+
     def show_dashboard(self):
+        self.log_and_show("dashboard")
         self.clear_screen()
+        colors = THEMES[self.theme]
         
-        header = tk.Frame(self.root, bg="#2c3e50", height=80)
-        header.pack(fill="x")
-        header.pack_propagate(False)
+        header = tk.Frame(self.root, bg=colors["header_bg"], height=70)
+        header.pack(fill="x"); header.pack_propagate(False)
+        tk.Label(header, text="✨ KabanFord", font=("Segoe UI", 20, "bold"), bg=colors["header_bg"], fg=colors["header_fg"]).pack(side="left", padx=30, pady=15)
         
-        logo = tk.Label(header, text=" KabanFord", font=("Arial", 24, "bold"), 
-                       bg="#2c3e50", fg="white")
-        logo.pack(side="left", padx=30, pady=20)
+        nav = tk.Frame(header, bg=colors["header_bg"])
+        nav.pack(side="left", padx=40, pady=15)
+        items = [("Курсы", "courses"), ("Преподаватели", "teachers"), ("Мои записи", "enrollments")]
+        if self.current_user and self.current_user["role"] == "admin": items.append(("Управление", "admin_panel"))
+        for t, s in items:
+            ttk.Button(nav, text=t, style="Soft.TButton", command=lambda s=s: getattr(self, f"show_{s}")()).pack(side="left", padx=8)
         
-        nav_frame = tk.Frame(header, bg="#2c3e50")
-        nav_frame.pack(side="left", padx=50, pady=20)
-        
-        for text, cmd in [("Курсы", lambda: messagebox.showinfo("Курсы", "Раздел в разработке")),
-                         ("Профиль", self.show_profile),
-                         ("Преподаватели", self.show_teachers)]:
-            btn = tk.Button(nav_frame, text=text, font=("Arial", 11),
-                           bg="#2c3e50", fg="white", bd=0,
-                           activebackground="#34495e", activeforeground="white",
-                           command=cmd, cursor="hand2")
-            btn.pack(side="left", padx=15)
-        
-        auth_frame = tk.Frame(header, bg="#2c3e50")
-        auth_frame.pack(side="right", padx=30, pady=20)
-        
+        auth = tk.Frame(header, bg=colors["header_bg"])
+        auth.pack(side="right", padx=30, pady=15)
         if self.current_user:
-            tk.Label(auth_frame, text=f"👤 {self.current_user['email']}", 
-                    bg="#2c3e50", fg="white", font=("Arial", 10)).pack(side="left", padx=10)
-            tk.Button(auth_frame, text="Выход", font=("Arial", 10),
-                     bg="#e74c3c", fg="white", bd=0, padx=15, pady=5,
-                     command=self.logout, cursor="hand2").pack(side="left", padx=5)
+            tk.Label(auth, text=f"👤 {self.current_user['email'].split('@')[0]}", bg=colors["header_bg"], fg=colors["header_fg"], font=("Segoe UI", 10)).pack(side="left", padx=8)
+            ttk.Button(auth, text="Профиль", style="Soft.TButton", command=self.show_profile).pack(side="left", padx=4)
+            ttk.Button(auth, text="Выход", style="Danger.TButton", command=self.logout).pack(side="left", padx=4)
         else:
-            tk.Button(auth_frame, text="Вход", font=("Arial", 10),
-                     bg="#3498db", fg="white", bd=0, padx=20, pady=5,
-                     command=self.show_login, cursor="hand2").pack(side="left", padx=5)
-            tk.Button(auth_frame, text="Регистрация", font=("Arial", 10),
-                     bg="#27ae60", fg="white", bd=0, padx=15, pady=5,
-                     command=self.show_register, cursor="hand2").pack(side="left", padx=5)
+            ttk.Button(auth, text="Вход", style="Soft.TButton", command=self.show_login).pack(side="left", padx=4)
+            ttk.Button(auth, text="Регистрация", style="Success.TButton", command=self.show_register).pack(side="left", padx=4)
         
-        content = tk.Frame(self.root, bg="#f5f5f5")
-        content.pack(fill="both", expand=True, padx=40, pady=40)
+        content = tk.Frame(self.root, bg=colors["bg"])
+        content.pack(fill="both", expand=True, padx=40, pady=30)
+        welcome = f"Добро пожаловать, {self.current_user['email'].split('@')[0]}!" if self.current_user else "Добро пожаловать в KabanFord!"
+        tk.Label(content, text=welcome, font=("Segoe UI", 26, "bold"), bg=colors["bg"], fg=colors["text"]).pack(pady=(0, 10))
+        tk.Label(content, text="Мы гордимся нашими достижениями и отзывами студентов", font=("Segoe UI", 12), bg=colors["bg"], fg=colors["text_secondary"]).pack(pady=(0, 40))
         
-        title = tk.Label(content, text="Наш прогресс Онлайн-Школы", 
-                        font=("Arial", 28, "bold"), bg="#f5f5f5", fg="#2c3e50")
-        title.pack(pady=(0, 10))
-        
-        subtitle = tk.Label(content, 
-                           text="Мы гордимся нашими достижениями и отзывами студентов",
-                           font=("Arial", 12), bg="#f5f5f5", fg="#7f8c8d")
-        subtitle.pack(pady=(0, 40))
-        
-        stats_frame = tk.Frame(content, bg="#f5f5f5")
-        stats_frame.pack(fill="x")
-        
-        stats_data = [
-            ("👥", "50k+", "Клиентов", "новых клиентов за год"),
-            ("👨‍", "90+", "Учителя", "методистов помогают ученикам"),
-            ("⭐", "99%", "Success", "довольных клиентов")
-        ]
-        
-        for icon, value, title_text, desc in stats_data:
-            stat_box = tk.Frame(stats_frame, bg="white", relief="raised", bd=2)
-            stat_box.pack(side="left", fill="both", expand=True, padx=15, pady=10)
-            
-            tk.Label(stat_box, text=icon, font=("Arial", 36), 
-                    bg="white").pack(pady=10)
-            tk.Label(stat_box, text=value, font=("Arial", 32, "bold"), 
-                    bg="white", fg="#2c3e50").pack()
-            tk.Label(stat_box, text=title_text, font=("Arial", 14, "bold"), 
-                    bg="white", fg="#34495e").pack()
-            tk.Label(stat_box, text=desc, font=("Arial", 9), 
-                    bg="white", fg="#95a5a6").pack(pady=(0, 10))
+        stats = tk.Frame(content, bg=colors["bg"])
+        stats.pack(fill="x")
+        c = db()
+        for icon, val, title, desc in [("👥", f"{c.execute('SELECT COUNT(*) FROM users').fetchone()[0]}+", "Пользователей", "в системе"),
+                                       ("👨‍🏫", f"{c.execute('SELECT COUNT(*) FROM teachers').fetchone()[0]}+", "Преподавателей", "в команде"),
+                                       ("📚", f"{c.execute('SELECT COUNT(*) FROM enrollments').fetchone()[0]}+", "Записей", "на курсы")]:
+            box = tk.Frame(stats, bg=colors["card_bg"], highlightbackground=colors["card_border"], highlightthickness=1)
+            box.pack(side="left", fill="both", expand=True, padx=15, pady=10)
+            inner = tk.Frame(box, bg=colors["card_bg"])
+            inner.pack(fill="both", expand=True, padx=20, pady=15)
+            tk.Label(inner, text=icon, font=("Segoe UI Emoji", 28), bg=colors["card_bg"]).pack()
+            tk.Label(inner, text=val, font=("Segoe UI", 24, "bold"), bg=colors["card_bg"], fg=colors["primary"]).pack()
+            tk.Label(inner, text=title, font=("Segoe UI", 12, "bold"), bg=colors["card_bg"], fg=colors["text"]).pack()
+            tk.Label(inner, text=desc, font=("Segoe UI", 9), bg=colors["card_bg"], fg=colors["text_secondary"]).pack()
+        c.close()
 
     def show_login(self):
+        self.log_and_show("login")
         self.clear_screen()
-        
-        tk.Button(self.root, text="← Назад", font=("Arial", 10),
-                 bg="#95a5a6", fg="white", bd=0, padx=15, pady=5,
-                 command=self.show_dashboard, cursor="hand2").place(x=20, y=20)
-        
-        login_frame = tk.Frame(self.root, bg="white", relief="raised", bd=3)
-        login_frame.place(relx=0.5, rely=0.5, anchor="center", width=400, height=350)
-        
-        tk.Label(login_frame, text="🔐 Вход в KabanFord", 
-                font=("Arial", 20, "bold"), bg="white", fg="#2c3e50").pack(pady=30)
-        
-        tk.Label(login_frame, text="Email", font=("Arial", 10), 
-                bg="white", fg="#7f8c8d").pack(anchor="w", padx=30)
-        email_entry = tk.Entry(login_frame, font=("Arial", 11), bd=2, relief="solid")
-        email_entry.pack(fill="x", padx=30, pady=5)
-        
-        tk.Label(login_frame, text="Пароль", font=("Arial", 10), 
-                bg="white", fg="#7f8c8d").pack(anchor="w", padx=30)
-        pwd_entry = tk.Entry(login_frame, font=("Arial", 11), show="*", bd=2, relief="solid")
-        pwd_entry.pack(fill="x", padx=30, pady=5)
-        
-        tk.Button(login_frame, text="Забыли пароль?", font=("Arial", 9),
-                 bg="white", fg="#3498db", bd=0, cursor="hand2",
-                 command=lambda: messagebox.showinfo("Восстановление", 
-                           "Обратитесь в поддержку: support@kabanford.ru")).pack(pady=10)
-        
-        error_label = tk.Label(login_frame, text="", font=("Arial", 9), 
-                              bg="white", fg="red")
-        error_label.pack()
-        
-        def do_login():
-            email = email_entry.get().strip()
-            password = pwd_entry.get()
-            
-            if not email or not password:
-                error_label.config(text="Заполните все поля")
-                return
-            
+        colors = THEMES[self.theme]
+        ttk.Button(self.root, text="← Назад", style="Soft.TButton", command=self.show_dashboard).place(x=20, y=20)
+        frm = tk.Frame(self.root, bg=colors["card_bg"], highlightbackground=colors["card_border"], highlightthickness=1)
+        frm.place(relx=0.5, rely=0.5, anchor="center", width=400, height=360)
+        tk.Label(frm, text="🔐 Вход", font=("Segoe UI", 20, "bold"), bg=colors["card_bg"], fg=colors["text"]).pack(pady=20)
+        for lbl, key, show in [("Email", "email", False), ("Пароль", "password", True)]:
+            tk.Label(frm, text=lbl, font=("Segoe UI", 10), bg=colors["card_bg"], fg=colors["text_secondary"]).pack(anchor="w", padx=30)
+            e = ttk.Entry(frm, style="Soft.TEntry")
+            if show: e.config(show="*")
+            e.pack(fill="x", padx=30, pady=4)
+            setattr(frm, f"{key}_entry", e)
+        err = tk.Label(frm, text="", font=("Segoe UI", 9), bg=colors["card_bg"], fg=colors["danger"])
+        err.pack()
+        def do():
+            email, pwd = frm.email_entry.get().strip(), frm.password_entry.get()
+            if not email or not pwd: err.config(text="Заполните все поля"); return
+            locked, rem = login_manager.is_locked(email)
+            if locked: err.config(text=f"Слишком много попыток. Ждите {rem}с."); frm.after(1000, do); return
             c = db()
-            user = c.execute("SELECT * FROM users WHERE email=? AND password=?",
-                           (email, hashlib.sha256(password.encode()).hexdigest())).fetchone()
+            user = c.execute("SELECT * FROM users WHERE email=? AND password=?", (email, hashlib.sha256(pwd.encode()).hexdigest())).fetchone()
             c.close()
-            
             if user:
+                login_manager.record_attempt(email, True)
                 self.current_user = dict(user)
+                log_action(email, user["role"], "LOGIN", "SUCCESS")
                 self.show_dashboard()
             else:
-                error_label.config(text="Неверный email или пароль")
-        
-        tk.Button(login_frame, text="Войти", font=("Arial", 12, "bold"),
-                 bg="#3498db", fg="white", bd=0, padx=30, pady=10,
-                 command=do_login, cursor="hand2").pack(pady=20)
-        
-        pwd_entry.bind("<Return>", lambda e: do_login())
+                login_manager.record_attempt(email, False)
+                locked, rem = login_manager.is_locked(email)
+                err.config(text=f"Аккаунт заблокирован на {rem}с." if locked else f"Неверные данные. Осталось: {MAX_ATTEMPTS-len(login_manager.attempts[email])}")
+                log_action(email, "unknown", "LOGIN", "FAILED")
+        ttk.Button(frm, text="Войти", style="Soft.TButton", command=do).pack(pady=20)
+        frm.password_entry.bind("<Return>", lambda e: do())
 
     def show_register(self):
+        self.log_and_show("register")
         self.clear_screen()
-        
-        tk.Button(self.root, text="← Назад", font=("Arial", 10),
-                 bg="#95a5a6", fg="white", bd=0, padx=15, pady=5,
-                 command=self.show_dashboard, cursor="hand2").place(x=20, y=20)
-        
-        reg_frame = tk.Frame(self.root, bg="white", relief="raised", bd=3)
-        reg_frame.place(relx=0.5, rely=0.5, anchor="center", width=400, height=400)
-        
-        tk.Label(reg_frame, text="📝 Регистрация", 
-                font=("Arial", 20, "bold"), bg="white", fg="#2c3e50").pack(pady=20)
-        
-        tk.Label(reg_frame, text="Email", font=("Arial", 10), 
-                bg="white", fg="#7f8c8d").pack(anchor="w", padx=30)
-        email_entry = tk.Entry(reg_frame, font=("Arial", 11), bd=2, relief="solid")
-        email_entry.pack(fill="x", padx=30, pady=5)
-        
-        tk.Label(reg_frame, text="Пароль", font=("Arial", 10), 
-                bg="white", fg="#7f8c8d").pack(anchor="w", padx=30)
-        pwd_entry = tk.Entry(reg_frame, font=("Arial", 11), show="*", bd=2, relief="solid")
-        pwd_entry.pack(fill="x", padx=30, pady=5)
-        
-        terms_var = tk.BooleanVar()
-        terms_check = tk.Checkbutton(reg_frame, 
-            text="Я согласен с условиями использования и политикой конфиденциальности",
-            variable=terms_var, bg="white", font=("Arial", 9), anchor="w")
-        terms_check.pack(padx=30, pady=15)
-        
-        error_label = tk.Label(reg_frame, text="", font=("Arial", 9), 
-                              bg="white", fg="red")
-        error_label.pack()
-        
-        def do_register():
-            email = email_entry.get().strip()
-            password = pwd_entry.get()
-            
-            if not email or not password:
-                error_label.config(text="Заполните все поля")
-                return
-            if not re.match(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$', email):
-                error_label.config(text="Неверный формат email")
-                return
-            if len(password) < 6:
-                error_label.config(text="Пароль должен быть не менее 6 символов")
-                return
-            if not terms_var.get():
-                error_label.config(text="Примите условия использования")
-                return
-            
+        colors = THEMES[self.theme]
+        ttk.Button(self.root, text="← Назад", style="Soft.TButton", command=self.show_dashboard).place(x=20, y=20)
+        frm = tk.Frame(self.root, bg=colors["card_bg"], highlightbackground=colors["card_border"], highlightthickness=1)
+        frm.place(relx=0.5, rely=0.5, anchor="center", width=420, height=480)
+        tk.Label(frm, text="📝 Регистрация", font=("Segoe UI", 20, "bold"), bg=colors["card_bg"], fg=colors["text"]).pack(pady=15)
+        ents = {}
+        for lbl, key, show in [("Email", "email", False), ("Пароль", "password", True), ("Подтвердите пароль", "confirm", True), ("Ваше имя", "full_name", False)]:
+            tk.Label(frm, text=lbl, font=("Segoe UI", 10), bg=colors["card_bg"], fg=colors["text_secondary"]).pack(anchor="w", padx=30)
+            e = ttk.Entry(frm, style="Soft.TEntry")
+            if show: e.config(show="*")
+            e.pack(fill="x", padx=30, pady=3)
+            ents[key] = e
+        terms = tk.BooleanVar()
+        ttk.Checkbutton(frm, text="Согласен с условиями и политикой конфиденциальности", variable=terms, style="Soft.TCheckbutton").pack(padx=30, pady=10)
+        err = tk.Label(frm, text="", font=("Segoe UI", 9), bg=colors["card_bg"], fg=colors["danger"])
+        err.pack()
+        def do():
+            email, pwd, conf, name = ents["email"].get().strip(), ents["password"].get(), ents["confirm"].get(), ents["full_name"].get().strip()
+            v, e = validate_email(email)
+            if not v: err.config(text=e); return
+            v, e = validate_password(pwd)
+            if not v: err.config(text=f"Пароль: {e}"); return
+            if pwd != conf: err.config(text="Пароли не совпадают"); return
+            if not name or len(name)<3: err.config(text="Имя минимум 3 символа"); return
+            if not terms.get(): err.config(text="Требуется согласие"); return
             c = db()
             try:
-                c.execute("INSERT INTO users(email,password,created_at) VALUES(?,?,?)",
-                         (email, hashlib.sha256(password.encode()).hexdigest(), 
-                          datetime.now().isoformat()))
-                c.commit()
-                c.close()
-                messagebox.showinfo("Успех", "Регистрация успешна! Теперь войдите.")
-                self.show_login()
-            except sqlite3.IntegrityError:
-                c.close()
-                error_label.config(text="Этот email уже зарегистрирован")
-        
-        tk.Button(reg_frame, text="Зарегистрироваться", font=("Arial", 12, "bold"),
-                 bg="#27ae60", fg="white", bd=0, padx=20, pady=10,
-                 command=do_register, cursor="hand2").pack(pady=20)
-
-    def show_teachers(self):
-        self.clear_screen()
-        
-        header = tk.Frame(self.root, bg="#2c3e50", height=60)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        
-        tk.Button(header, text="← Назад", font=("Arial", 10),
-                 bg="#34495e", fg="white", bd=0, padx=15, pady=5,
-                 command=self.show_dashboard, cursor="hand2").pack(side="left", padx=20, pady=10)
-        
-        tk.Label(header, text="👨‍🏫 Преподаватели", font=("Arial", 18, "bold"),
-                bg="#2c3e50", fg="white").pack(pady=15)
-        
-        content = tk.Frame(self.root, bg="#f5f5f5")
-        content.pack(fill="both", expand=True, padx=40, pady=30)
-        
-        headers_frame = tk.Frame(content, bg="#34495e")
-        headers_frame.pack(fill="x")
-        
-        headers = [("Преподаватели", 300), ("Стоимость обучения", 200), 
-                  ("Рейтинг", 150), ("Запись", 150)]
-        for text, width in headers:
-            tk.Label(headers_frame, text=text, font=("Arial", 11, "bold"),
-                    bg="#34495e", fg="white", width=width//8).pack(side="left", padx=5, pady=10)
-        
-        c = db()
-        teachers = c.execute("SELECT * FROM teachers").fetchall()
-        c.close()
-        
-        for teacher in teachers:
-            row = tk.Frame(content, bg="white", relief="raised", bd=1)
-            row.pack(fill="x", pady=5)
-            
-            info_frame = tk.Frame(row, bg="white")
-            info_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
-            
-            tk.Label(info_frame, text=teacher["name"], 
-                    font=("Arial", 12, "bold"), bg="white", 
-                    fg="#2c3e50", anchor="w").pack()
-            tk.Label(info_frame, text=teacher["description"], 
-                    font=("Arial", 9), bg="white", 
-                    fg="#7f8c8d", anchor="w").pack()
-            
-            tk.Label(row, text=f"{teacher['price']} РУБ.", 
-                    font=("Arial", 12, "bold"), bg="white", 
-                    fg="#e74c3c", width=20).pack(side="left", padx=10)
-            
-            stars = "⭐" * int(teacher["rating"])
-            tk.Label(row, text=stars, font=("Arial", 14), 
-                    bg="white", width=15).pack(side="left")
-            
-            def book(teacher_id=teacher["id"], name=teacher["name"]):
-                if not self.current_user:
-                    messagebox.showwarning("Внимание", "Сначала войдите в систему!")
-                    self.show_login()
-                    return
-                if messagebox.askyesno("Запись", f"Записаться к {name}?"):
-                    c = db()
-                    c.execute("INSERT INTO enrollments(user_id,teacher_id,date) VALUES(?,?,?)",
-                             (self.current_user["id"], teacher_id, datetime.now().isoformat()))
-                    c.commit()
-                    c.close()
-                    messagebox.showinfo("Успех", f"Вы записаны к {name}!")
-            
-            tk.Button(row, text="Записаться", font=("Arial", 10),
-                     bg="#27ae60", fg="white", bd=0, padx=15, pady=5,
-                     command=book, cursor="hand2").pack(side="left", padx=10, pady=10)
+                c.execute("INSERT INTO users(email,password,role,created_at) VALUES(?,?,?,?)", (email, hashlib.sha256(pwd.encode()).hexdigest(), "student", datetime.now().isoformat()))
+                c.commit(); c.close()
+                log_action(email, "student", "REGISTER", "SUCCESS")
+                messagebox.showinfo("Успех", "Регистрация успешна!"); self.show_login()
+            except sqlite3.IntegrityError: c.close(); err.config(text="Email уже занят"); log_action(email, "student", "REGISTER", "FAILED")
+        ttk.Button(frm, text="Зарегистрироваться", style="Success.TButton", command=do).pack(pady=20)
 
     def show_profile(self):
-        if not self.current_user:
-            messagebox.showwarning("Внимание", "Сначала войдите в систему!")
-            self.show_login()
-            return
-        
+        if not self.current_user: messagebox.showwarning("Внимание", "Сначала войдите!"); self.show_login(); return
+        self.log_and_show("profile")
         self.clear_screen()
+        colors = THEMES[self.theme]
+        header = tk.Frame(self.root, bg=colors["header_bg"], height=60); header.pack(fill="x"); header.pack_propagate(False)
+        ttk.Button(header, text="← Назад", style="Soft.TButton", command=self.show_dashboard).pack(side="left", padx=20, pady=10)
+        tk.Label(header, text="👤 Профиль", font=("Segoe UI", 18, "bold"), bg=colors["header_bg"], fg=colors["header_fg"]).pack(pady=12)
+        content = tk.Frame(self.root, bg=colors["bg"]); content.pack(fill="both", expand=True, padx=40, pady=30)
+        box = tk.Frame(content, bg=colors["card_bg"], highlightbackground=colors["card_border"], highlightthickness=1)
+        box.pack(fill="both", expand=True, padx=80, pady=20)
+        tk.Label(box, text="Информация", font=("Segoe UI", 16, "bold"), bg=colors["card_bg"], fg=colors["text"]).pack(pady=15)
+        for l, v in [("Email:", self.current_user["email"]), ("Роль:", self.current_user["role"]), ("Дата:", self.current_user["created_at"][:10])]:
+            f = tk.Frame(box, bg=colors["card_bg"]); f.pack(fill="x", padx=30, pady=4)
+            tk.Label(f, text=l, font=("Segoe UI", 10, "bold"), bg=colors["card_bg"], fg=colors["text_secondary"], width=15, anchor="w").pack(side="left")
+            tk.Label(f, text=v, font=("Segoe UI", 10), bg=colors["card_bg"], fg=colors["text"]).pack(side="left")
+        tk.Label(box, text="Тёмная тема:", font=("Segoe UI", 10), bg=colors["card_bg"], fg=colors["text"]).pack(anchor="w", padx=30, pady=(15,5))
+        is_dark = tk.BooleanVar(value=self.theme=="dark")
+        ttk.Checkbutton(box, variable=is_dark, command=lambda: self.toggle_theme(is_dark.get()), style="Soft.TCheckbutton").pack(anchor="w", padx=40, pady=5)
         
-        header = tk.Frame(self.root, bg="#2c3e50", height=60)
-        header.pack(fill="x")
-        header.pack_propagate(False)
-        
-        tk.Button(header, text="← Назад", font=("Arial", 10),
-                 bg="#34495e", fg="white", bd=0, padx=15, pady=5,
-                 command=self.show_dashboard, cursor="hand2").pack(side="left", padx=20, pady=10)
-        
-        tk.Label(header, text="👤 Профиль пользователя", font=("Arial", 18, "bold"),
-                bg="#2c3e50", fg="white").pack(pady=15)
-        
-        content = tk.Frame(self.root, bg="#f5f5f5")
-        content.pack(fill="both", expand=True, padx=40, pady=30)
-        
-        info_frame = tk.Frame(content, bg="white", relief="raised", bd=2)
-        info_frame.pack(fill="both", expand=True, padx=100, pady=30)
-        
-        tk.Label(info_frame, text="Информация о пользователе", 
-                font=("Arial", 16, "bold"), bg="white", 
-                fg="#2c3e50").pack(pady=20)
-        
-        details = [
-            ("Email:", self.current_user["email"]),
-            ("Роль:", self.current_user["role"]),
-            ("Дата регистрации:", self.current_user["created_at"][:10])
-        ]
-        
-        for label, value in details:
-            frame = tk.Frame(info_frame, bg="#ecf0f1")
-            frame.pack(fill="x", padx=30, pady=5)
-            tk.Label(frame, text=label, font=("Arial", 11, "bold"),
-                    bg="#ecf0f1", fg="#7f8c8d", width=20, anchor="w").pack(side="left", padx=10, pady=10)
-            tk.Label(frame, text=value, font=("Arial", 11),
-                    bg="#ecf0f1", fg="#2c3e50", anchor="w").pack(side="left", padx=10, pady=10)
-        
+        tk.Label(box, text="Мои записи:", font=("Segoe UI", 14, "bold"), bg=colors["card_bg"], fg=colors["text"]).pack(pady=(15,10))
         c = db()
-        enrollments = c.execute("""
-            SELECT t.name, t.price, e.date 
-            FROM enrollments e
-            JOIN teachers t ON e.teacher_id = t.id
-            WHERE e.user_id = ?
-        """, (self.current_user["id"],)).fetchall()
+        enroll = c.execute("SELECT t.name, c.title, c.price, e.date FROM enrollments e LEFT JOIN teachers t ON e.teacher_id=t.id LEFT JOIN courses c ON e.course_id=c.id WHERE e.user_id=?", (self.current_user["id"],)).fetchall()
         c.close()
-        
-        tk.Label(info_frame, text="\nМои записи к преподавателям:", 
-                font=("Arial", 14, "bold"), bg="white", 
-                fg="#2c3e50").pack(pady=(30, 10))
-        
-        if enrollments:
-            for enr in enrollments:
-                tk.Label(info_frame, text=f"• {enr[0]} - {enr[1]} РУБ. ({enr[2][:10]})",
-                        font=("Arial", 10), bg="white", 
-                        fg="#34495e").pack(anchor="w", padx=30, pady=2)
-        else:
-            tk.Label(info_frame, text="Пока нет записей", 
-                    font=("Arial", 10), bg="white", 
-                    fg="#95a5a6").pack(pady=10)
-        
-        tk.Button(info_frame, text="Экспорт в CSV", font=("Arial", 10),
-                 bg="#3498db", fg="white", bd=0, padx=15, pady=5,
-                 command=lambda: self.export_profile(enrollments), 
-                 cursor="hand2").pack(pady=20)
+        if enroll:
+            for e in enroll: tk.Label(box, text=f"• {e[1] or e[0]} - {e[2] or 0}₽ ({(e[3] or '')[:10]})", font=("Segoe UI", 9), bg=colors["card_bg"], fg=colors["text"]).pack(anchor="w", padx=30, pady=1)
+        else: tk.Label(box, text="Пока нет записей", font=("Segoe UI", 10), bg=colors["card_bg"], fg=colors["text_secondary"]).pack(pady=10)
+        ttk.Button(box, text="📥 Экспорт в CSV", style="Soft.TButton", command=lambda: self.export_enrollments(enroll)).pack(pady=15)
+        log_action(self.current_user["email"], self.current_user["role"], "VIEW_PROFILE", "SUCCESS")
 
-    def export_profile(self, enrollments):
-        if not enrollments:
-            messagebox.showinfo("Экспорт", "Нет данных для экспорта")
-            return
-        path = f"exports/profile_{self.current_user['id']}.csv"
+    def toggle_theme(self, dark):
+        self.theme = "dark" if dark else "light"
+        self.config["theme"] = self.theme; save_config(self.config); self.apply_theme()
+        log_action(self.current_user["email"] if self.current_user else "guest", self.current_user["role"] if self.current_user else "guest", "CHANGE_THEME", f"SUCCESS_{self.theme}")
+
+    def export_enrollments(self, enrollments):
+        if not enrollments: messagebox.showinfo("Экспорт", "Нет данных"); return
+        path = f"exports/enrollments_{self.current_user['id']}_{datetime.now().strftime('%Y%m%d')}.csv"
         Path("exports").mkdir(exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Преподаватель", "Цена", "Дата"])
-            for enr in enrollments:
-                writer.writerow(enr)
-        messagebox.showinfo("Экспорт", f"Данные сохранены: {path}")
+            w = csv.writer(f); w.writerow(["Преподаватель", "Курс", "Цена", "Дата"])
+            for e in enrollments: w.writerow(e)
+        messagebox.showinfo("Экспорт", f"Сохранено: {path}")
+        log_action(self.current_user["email"], self.current_user["role"], "EXPORT_ENROLLMENTS", "SUCCESS")
+
+    def show_teachers(self):
+        self.log_and_show("teachers")
+        self.clear_screen()
+        colors = THEMES[self.theme]
+        header = tk.Frame(self.root, bg=colors["header_bg"], height=60); header.pack(fill="x"); header.pack_propagate(False)
+        ttk.Button(header, text="← Назад", style="Soft.TButton", command=self.show_dashboard).pack(side="left", padx=20, pady=10)
+        tk.Label(header, text="👨‍🏫 Преподаватели", font=("Segoe UI", 18, "bold"), bg=colors["header_bg"], fg=colors["header_fg"]).pack(pady=12)
+        content = tk.Frame(self.root, bg=colors["bg"]); content.pack(fill="both", expand=True, padx=40, pady=20)
+        sf = tk.Frame(content, bg=colors["bg"]); sf.pack(fill="x", pady=(0,10))
+        tk.Label(sf, text="🔍 Поиск:", font=("Segoe UI", 10), bg=colors["bg"], fg=colors["text"]).pack(side="left")
+        sv = tk.StringVar(); ttk.Entry(sf, textvariable=sv, style="Soft.TEntry").pack(side="left", padx=10, fill="x", expand=True)
+        if self.current_user and self.current_user["role"]=="admin":
+            ttk.Button(sf, text="➕ Добавить", style="Success.TButton", command=lambda: self.edit_teacher(None)).pack(side="left", padx=10)
+        tree = ttk.Treeview(content, style="Soft.Treeview", columns=("id","name","desc","price","rating"), show="headings")
+        tree.heading("id", text="ID"); tree.column("id", width=40, anchor="center")
+        tree.heading("name", text="Имя"); tree.column("name", width=200, anchor="w")
+        tree.heading("desc", text="Описание"); tree.column("desc", width=350, anchor="w")
+        tree.heading("price", text="Цена"); tree.column("price", width=80, anchor="center")
+        tree.heading("rating", text="Рейтинг"); tree.column("rating", width=80, anchor="center")
+        tree.pack(fill="both", expand=True)
+        def render(txt=""):
+            for i in tree.get_children(): tree.delete(i)
+            c=db()
+            rows = c.execute("SELECT * FROM teachers WHERE name LIKE ? OR description LIKE ?", (f"%{txt}%",f"%{txt}%")).fetchall()
+            c.close()
+            for r in rows: tree.insert("", "end", values=(r["id"], r["name"], (r["description"][:40]+"...") if len(r["description"])>40 else r["description"], f"{r['price']}₽", "⭐"*int(r["rating"])))
+            def on_sel(e):
+                iid = tree.selection()
+                if not iid: return
+                tid, tname = tree.item(iid[0])["values"][0], tree.item(iid[0])["values"][1]
+                def book():
+                    if not self.current_user: messagebox.showwarning("Внимание", "Войдите!"); return
+                    if messagebox.askyesno("Запись", f"Записаться к {tname}?"):
+                        c=db(); c.execute("INSERT INTO enrollments(user_id,teacher_id,date) VALUES(?,?,?)", (self.current_user["id"], tid, datetime.now().isoformat())); c.commit(); c.close()
+                        messagebox.showinfo("Успех", f"Записаны к {tname}!"); log_action(self.current_user["email"], self.current_user["role"], "BOOK_TEACHER", "SUCCESS")
+                def edit(): self.edit_teacher(tid)
+                def delete():
+                    if messagebox.askyesno("Подтверждение", f"Вы действительно хотите удалить запись №{tid}? Это действие нельзя отменить, и все ваши котики умрут от грусти"):
+                        c=db(); c.execute("DELETE FROM teachers WHERE id=?", (tid,)); c.commit(); c.close()
+                        messagebox.showinfo("Удалено", "Преподаватель удалён"); log_action(self.current_user["email"], self.current_user["role"], "DELETE_TEACHER", "SUCCESS"); render(sv.get())
+                popup = tk.Menu(content, tearoff=0)
+                popup.add_command(label="📝 Записаться", command=book)
+                if self.current_user and self.current_user["role"]=="admin":
+                    popup.add_command(label="✏️ Редактировать", command=edit)
+                    popup.add_command(label="🗑️ Удалить", command=delete)
+                popup.post(content.winfo_pointerx(), content.winfo_pointery())
+            tree.bind("<<TreeviewSelect>>", on_sel)
+        sv.trace_add("write", lambda *a: render(sv.get())); render()
+        ttk.Button(content, text="📥 Экспорт в CSV", style="Soft.TButton", command=lambda: self.export_csv("teachers")).pack(pady=10)
+        log_action(self.current_user["email"] if self.current_user else "guest", self.current_user["role"] if self.current_user else "guest", "VIEW_TEACHERS", "SUCCESS")
+
+    def edit_teacher(self, tid):
+        colors = THEMES[self.theme]
+        top = tk.Toplevel(self.root); top.title("Преподаватель"); top.geometry("450x350"); top.configure(bg=colors["bg"])
+        c=db(); t = c.execute("SELECT * FROM teachers WHERE id=?", (tid,)).fetchone() if tid else None; c.close()
+        tk.Label(top, text="✏️ Преподаватель", font=("Segoe UI", 16, "bold"), bg=colors["bg"], fg=colors["text"]).pack(pady=15)
+        ents={}
+        for l,k in [("Имя*", "name"), ("Описание", "desc"), ("Цена*", "price"), ("Рейтинг", "rating")]:
+            tk.Label(top, text=l, font=("Segoe UI", 10), bg=colors["bg"], fg=colors["text_secondary"]).pack(anchor="w", padx=30)
+            e=ttk.Entry(top, style="Soft.TEntry"); ents[k]=e
+            if t: e.insert(0, t["description"] if k=="desc" else (t["price"] if k!="rating" else t["rating"]))
+            e.pack(fill="x", padx=30, pady=3)
+        err=tk.Label(top, text="", font=("Segoe UI", 9), bg=colors["bg"], fg=colors["danger"]); err.pack()
+        def save():
+            name, desc, price, rating = ents["name"].get().strip(), ents["desc"].get(), ents["price"].get().strip(), ents["rating"].get().strip() or 0
+            if not name or len(name)<3: err.config(text="Имя минимум 3 символа"); return
+            try: price=float(price); rating=float(rating)
+            except: err.config(text="Цена и рейтинг должны быть числами"); return
+            c=db()
+            if c.execute("SELECT id FROM teachers WHERE name=? AND id!=?", (name, tid or 0)).fetchone(): err.config(text="Имя уже занято"); c.close(); return
+            if tid: c.execute("UPDATE teachers SET name=?, description=?, price=?, rating=? WHERE id=?", (name, desc, price, rating, tid))
+            else: c.execute("INSERT INTO teachers(name,description,price,rating) VALUES(?,?,?,?)", (name, desc, price, rating))
+            c.commit(); c.close(); messagebox.showinfo("Успех", "Сохранено!"); top.destroy(); self.show_teachers()
+            log_action(self.current_user["email"], self.current_user["role"], "UPDATE_TEACHER" if tid else "CREATE_TEACHER", "SUCCESS")
+        ttk.Button(top, text="💾 Сохранить", style="Success.TButton", command=save).pack(pady=15)
+
+    def show_courses(self):
+        self.log_and_show("courses")
+        self.clear_screen()
+        colors = THEMES[self.theme]
+        header = tk.Frame(self.root, bg=colors["header_bg"], height=60); header.pack(fill="x"); header.pack_propagate(False)
+        ttk.Button(header, text="← Назад", style="Soft.TButton", command=self.show_dashboard).pack(side="left", padx=20, pady=10)
+        tk.Label(header, text="📚 Курсы", font=("Segoe UI", 18, "bold"), bg=colors["header_bg"], fg=colors["header_fg"]).pack(pady=12)
+        content = tk.Frame(self.root, bg=colors["bg"]); content.pack(fill="both", expand=True, padx=40, pady=20)
+        sf = tk.Frame(content, bg=colors["bg"]); sf.pack(fill="x", pady=(0,10))
+        tk.Label(sf, text="🔍 Поиск:", font=("Segoe UI", 10), bg=colors["bg"], fg=colors["text"]).pack(side="left")
+        sv = tk.StringVar(); ttk.Entry(sf, textvariable=sv, style="Soft.TEntry").pack(side="left", padx=10, fill="x", expand=True)
+        if self.current_user and self.current_user["role"]=="admin":
+            ttk.Button(sf, text="➕ Добавить", style="Success.TButton", command=lambda: self.edit_course(None)).pack(side="left", padx=10)
+        tree = ttk.Treeview(content, style="Soft.Treeview", columns=("id","title","teacher","price","hours"), show="headings")
+        tree.heading("id", text="ID"); tree.column("id", width=40, anchor="center")
+        tree.heading("title", text="Название"); tree.column("title", width=250, anchor="w")
+        tree.heading("teacher", text="Преподаватель"); tree.column("teacher", width=200, anchor="w")
+        tree.heading("price", text="Цена"); tree.column("price", width=80, anchor="center")
+        tree.heading("hours", text="Часы"); tree.column("hours", width=60, anchor="center")
+        tree.pack(fill="both", expand=True)
+        def render(txt=""):
+            for i in tree.get_children(): tree.delete(i)
+            c=db()
+            rows = c.execute("""SELECT c.id, c.title, t.name, c.price, c.duration_hours FROM courses c LEFT JOIN teachers t ON c.teacher_id=t.id WHERE c.title LIKE ? OR t.name LIKE ?""", (f"%{txt}%",f"%{txt}%")).fetchall()
+            c.close()
+            for r in rows: tree.insert("", "end", values=(r["id"], r["title"], r["name"] or "—", f"{r['price']}₽", r["duration_hours"]))
+            def on_sel(e):
+                iid = tree.selection()
+                if not iid: return
+                cid, title = tree.item(iid[0])["values"][0], tree.item(iid[0])["values"][1]
+                def enroll():
+                    if not self.current_user: messagebox.showwarning("Внимание", "Войдите!"); return
+                    if messagebox.askyesno("Запись", f"Записаться на '{title}'?"):
+                        c=db(); t_id=c.execute("SELECT teacher_id FROM courses WHERE id=?", (cid,)).fetchone()["teacher_id"]
+                        c.execute("INSERT INTO enrollments(user_id,course_id,teacher_id,date) VALUES(?,?,?,?)", (self.current_user["id"], cid, t_id, datetime.now().isoformat()))
+                        c.commit(); c.close(); messagebox.showinfo("Успех", "Записаны!"); log_action(self.current_user["email"], self.current_user["role"], "ENROLL_COURSE", "SUCCESS")
+                def edit(): self.edit_course(cid)
+                def delete():
+                    if messagebox.askyesno("Подтверждение", f"Вы действительно хотите удалить запись №{cid}? Это действие нельзя отменить, и все ваши котики умрут от грусти"):
+                        c=db(); c.execute("DELETE FROM courses WHERE id=?", (cid,)); c.commit(); c.close()
+                        messagebox.showinfo("Удалено", "Курс удалён"); log_action(self.current_user["email"], self.current_user["role"], "DELETE_COURSE", "SUCCESS"); render(sv.get())
+                popup = tk.Menu(content, tearoff=0)
+                popup.add_command(label="📝 Записаться", command=enroll)
+                if self.current_user and self.current_user["role"]=="admin":
+                    popup.add_command(label="✏️ Редактировать", command=edit)
+                    popup.add_command(label="🗑️ Удалить", command=delete)
+                popup.post(content.winfo_pointerx(), content.winfo_pointery())
+            tree.bind("<<TreeviewSelect>>", on_sel)
+        sv.trace_add("write", lambda *a: render(sv.get())); render()
+        ttk.Button(content, text="📥 Экспорт в CSV", style="Soft.TButton", command=lambda: self.export_csv("courses")).pack(pady=10)
+        log_action(self.current_user["email"] if self.current_user else "guest", self.current_user["role"] if self.current_user else "guest", "VIEW_COURSES", "SUCCESS")
+
+    def edit_course(self, cid):
+        colors = THEMES[self.theme]
+        top = tk.Toplevel(self.root); top.title("Курс"); top.geometry("450x400"); top.configure(bg=colors["bg"])
+        c=db(); crs = c.execute("SELECT * FROM courses WHERE id=?", (cid,)).fetchone() if cid else None
+        teachers = c.execute("SELECT id, name FROM teachers").fetchall(); c.close()
+        tk.Label(top, text="📚 Курс", font=("Segoe UI", 16, "bold"), bg=colors["bg"], fg=colors["text"]).pack(pady=15)
+        ents={}
+        for l,k in [("Название*", "title"), ("Описание", "desc")]:
+            tk.Label(top, text=l, font=("Segoe UI", 10), bg=colors["bg"], fg=colors["text_secondary"]).pack(anchor="w", padx=30)
+            e=ttk.Entry(top, style="Soft.TEntry"); ents[k]=e
+            if crs: e.insert(0, crs["description"] if k=="desc" else crs["title"])
+            e.pack(fill="x", padx=30, pady=3)
+        tk.Label(top, text="Преподаватель", font=("Segoe UI", 10), bg=colors["bg"], fg=colors["text_secondary"]).pack(anchor="w", padx=30)
+        tv = tk.StringVar(); cb = ttk.Combobox(top, textvariable=tv, style="Soft.TCombobox", state="readonly")
+        cb["values"] = [f"{t['id']}: {t['name']}" for t in teachers]
+        if crs: cb.set(f"{crs['teacher_id']}: {[t['name'] for t in teachers if t['id']==crs['teacher_id']][0]}")
+        cb.pack(fill="x", padx=30, pady=3); ents["tid"]=lambda: int(tv.get().split(":")[0]) if tv.get() else None
+        for l,k in [("Цена*", "price"), ("Часы*", "hours")]:
+            tk.Label(top, text=l, font=("Segoe UI", 10), bg=colors["bg"], fg=colors["text_secondary"]).pack(anchor="w", padx=30)
+            e=ttk.Entry(top, style="Soft.TEntry"); ents[k]=e
+            if crs: e.insert(0, crs["price"] if k=="price" else crs["duration_hours"])
+            e.pack(fill="x", padx=30, pady=3)
+        err=tk.Label(top, text="", font=("Segoe UI", 9), bg=colors["bg"], fg=colors["danger"]); err.pack()
+        def save():
+            title, desc = ents["title"].get().strip(), ents["desc"].get()
+            if not title or len(title)<3: err.config(text="Название минимум 3 символа"); return
+            try: price=float(ents["price"].get().strip()); hours=int(ents["hours"].get().strip())
+            except: err.config(text="Цена и часы должны быть числами"); return
+            c=db()
+            if c.execute("SELECT id FROM courses WHERE title=? AND id!=?", (title, cid or 0)).fetchone(): err.config(text="Название уже занято"); c.close(); return
+            tid = ents["tid"]()
+            if cid: c.execute("UPDATE courses SET title=?, description=?, teacher_id=?, price=?, duration_hours=? WHERE id=?", (title, desc, tid, price, hours, cid))
+            else: c.execute("INSERT INTO courses(title,description,teacher_id,price,duration_hours) VALUES(?,?,?,?,?)", (title, desc, tid, price, hours))
+            c.commit(); c.close(); messagebox.showinfo("Успех", "Сохранено!"); top.destroy(); self.show_courses()
+            log_action(self.current_user["email"], self.current_user["role"], "UPDATE_COURSE" if cid else "CREATE_COURSE", "SUCCESS")
+        ttk.Button(top, text="💾 Сохранить", style="Success.TButton", command=save).pack(pady=15)
+
+    def show_enrollments(self):
+        self.log_and_show("enrollments")
+        self.clear_screen()
+        colors = THEMES[self.theme]
+        header = tk.Frame(self.root, bg=colors["header_bg"], height=60); header.pack(fill="x"); header.pack_propagate(False)
+        ttk.Button(header, text="← Назад", style="Soft.TButton", command=self.show_dashboard).pack(side="left", padx=20, pady=10)
+        tk.Label(header, text="📋 Мои записи", font=("Segoe UI", 18, "bold"), bg=colors["header_bg"], fg=colors["header_fg"]).pack(pady=12)
+        content = tk.Frame(self.root, bg=colors["bg"]); content.pack(fill="both", expand=True, padx=40, pady=20)
+        if not self.current_user: tk.Label(content, text="Войдите, чтобы увидеть записи", font=("Segoe UI", 14), bg=colors["bg"], fg=colors["text"]).pack(pady=50); return
+        c=db()
+        q = """SELECT e.id, t.name, c.title, c.price, e.date FROM enrollments e LEFT JOIN teachers t ON e.teacher_id=t.id LEFT JOIN courses c ON e.course_id=c.id"""
+        params = ()
+        if self.current_user["role"] != "admin": q += " WHERE e.user_id=?"; params=(self.current_user["id"],)
+        rows = c.execute(q, params).fetchall(); c.close()
+        tree = ttk.Treeview(content, style="Soft.Treeview", columns=("id","teacher","course","price","date"), show="headings")
+        for h,w in [("ID",40),("Преподаватель",200),("Курс",250),("Цена",80),("Дата",120)]: tree.heading(h, text=h); tree.column(h, width=w, anchor="w" if w>60 else "center")
+        tree.pack(fill="both", expand=True)
+        for r in rows: tree.insert("", "end", values=(r["id"], r["name"] or "—", r["title"] or "—", f"{r['price']}₽", (r["date"] or "")[:10]))
+        ttk.Button(content, text="📥 Экспорт в CSV", style="Soft.TButton", command=lambda: self.export_enrollments(rows)).pack(pady=10)
+        log_action(self.current_user["email"], self.current_user["role"], "VIEW_ENROLLMENTS", "SUCCESS")
+
+    def show_admin_panel(self):
+        if not self.current_user or self.current_user["role"]!="admin": messagebox.showwarning("Доступ запрещён", "Только для администраторов"); return
+        self.log_and_show("admin_panel")
+        self.clear_screen()
+        colors = THEMES[self.theme]
+        header = tk.Frame(self.root, bg=colors["header_bg"], height=60); header.pack(fill="x"); header.pack_propagate(False)
+        ttk.Button(header, text="← Назад", style="Soft.TButton", command=self.show_dashboard).pack(side="left", padx=20, pady=10)
+        tk.Label(header, text="⚙️ Управление", font=("Segoe UI", 18, "bold"), bg=colors["header_bg"], fg=colors["header_fg"]).pack(pady=12)
+        content = tk.Frame(self.root, bg=colors["bg"]); content.pack(fill="both", expand=True, padx=40, pady=20)
+        tk.Label(content, text="Пользователи", font=("Segoe UI", 16, "bold"), bg=colors["bg"], fg=colors["text"]).pack(pady=(0,15))
+        tree = ttk.Treeview(content, style="Soft.Treeview", columns=("id","email","role","date"), show="headings")
+        for h,w in [("ID",40),("Email",300),("Роль",100),("Дата",120)]: tree.heading(h, text=h); tree.column(h, width=w, anchor="center" if w<100 else "w")
+        tree.pack(fill="both", expand=True)
+        c=db()
+        for r in c.execute("SELECT id,email,role,created_at FROM users").fetchall():
+            if r["email"] != "admin@kabanford.ru":
+                tree.insert("", "end", values=(r["id"], r["email"], r["role"], (r["created_at"] or "")[:10]))
+        c.close()
+        def on_sel(e):
+            iid = tree.selection()
+            if not iid: return
+            uid = tree.item(iid[0])["values"][0]
+            def delete():
+                if messagebox.askyesno("Подтверждение", f"Вы действительно хотите удалить запись №{uid}? Это действие нельзя отменить, и все ваши котики умрут от грусти"):
+                    c=db(); c.execute("DELETE FROM users WHERE id=?", (uid,)); c.commit(); c.close()
+                    messagebox.showinfo("Удалено", "Пользователь удалён"); log_action(self.current_user["email"], self.current_user["role"], "DELETE_USER", "SUCCESS"); self.show_admin_panel()
+            popup = tk.Menu(content, tearoff=0)
+            popup.add_command(label="🗑️ Удалить", command=delete)
+            popup.post(content.winfo_pointerx(), content.winfo_pointery())
+        tree.bind("<<TreeviewSelect>>", on_sel)
+        log_action(self.current_user["email"], self.current_user["role"], "VIEW_ADMIN_PANEL", "SUCCESS")
+
+    def export_csv(self, table):
+        c=db(); rows=c.execute(f"SELECT * FROM {table}").fetchall(); c.close()
+        if not rows: messagebox.showinfo("Экспорт", "Нет данных"); return
+        path=f"exports/{table}_{datetime.now().strftime('%Y%m%d')}.csv"
+        Path("exports").mkdir(exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w=csv.writer(f); w.writerow(rows[0].keys())
+            for r in rows: w.writerow(r)
+        messagebox.showinfo("Экспорт", f"Сохранено: {path}")
+        log_action(self.current_user["email"] if self.current_user else "guest", self.current_user["role"] if self.current_user else "guest", f"EXPORT_{table.upper()}", "SUCCESS")
 
     def logout(self):
-        if messagebox.askyesno("Выход", "Выйти из аккаунта?"):
-            self.current_user = None
-            self.show_dashboard()
+        if not messagebox.askyesno("Выход", "Вы уверены, что хотите выйти?"): return
+        email = self.current_user["email"] if self.current_user else "guest"
+        role = self.current_user["role"] if self.current_user else "guest"
+        log_action(email, role, "LOGOUT", "SUCCESS")
+        self.current_user = None; self.show_dashboard()
 
 if __name__ == "__main__":
     KabanFordApp()
